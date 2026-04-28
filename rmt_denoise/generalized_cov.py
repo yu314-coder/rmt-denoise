@@ -30,13 +30,56 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 
+from scipy.optimize import minimize_scalar
+
 from .core import (
-    compute_G_minus,
-    compute_G_plus,
     images_to_matrix,
     matrix_to_images,
 )
 from .io import load_folder, split_train_test
+
+
+# ============================================================================
+# Generalized-covariance bulk edges, ported verbatim from the in-app
+# best_a_beta reference implementation. Crucial points:
+#   * g_minus = max_{t > 0} g(t) (always — regardless of y)
+#   * g_plus  = min over the regime-switched interval
+#               I^+(a) = (-1/a, 0)  if a >= 1
+#               I^+(a) = (-1, 0)    if 0 < a < 1
+#   * Reduces to the classical MP edges only when |a - 1| < 1e-9
+#     OR beta is at one of the degenerate ends.
+# ============================================================================
+
+
+def _g_func(t, a, y, beta):
+    return ((y * beta * (a - 1.0) * t + (a * t + 1.0) * ((y - 1.0) * t - 1.0))
+            / ((a * t + 1.0) * (t * t + t)))
+
+
+def _g_edges(a, beta, y):
+    """Return (g_minus, g_plus). Mirrors the in-app `_bulk_edges` exactly."""
+    a = float(a); beta = float(beta); y = float(y)
+    if abs(a - 1.0) < 1e-9 or beta < 1e-9 or beta > 1.0 - 1e-9:
+        rty = float(np.sqrt(max(y, 0.0)))
+        return max((1.0 - rty) ** 2, 0.0), (1.0 + rty) ** 2
+
+    # g_minus: maximise g(t) over t > 0 (search in log space for stability)
+    res_lo = minimize_scalar(
+        lambda u: -_g_func(np.exp(u), a, y, beta),
+        bounds=(-14.0, 14.0), method='bounded',
+        options={'xatol': 1e-10, 'maxiter': 100},
+    )
+    g_minus = -res_lo.fun
+
+    # g_plus: minimise g(t) over the regime-switched interval
+    upper_left = (-1.0 / a + 1e-10) if a >= 1.0 else (-1.0 + 1e-10)
+    upper_right = -1e-10
+    res_hi = minimize_scalar(
+        lambda t: _g_func(t, a, y, beta),
+        bounds=(upper_left, upper_right), method='bounded',
+        options={'xatol': 1e-10, 'maxiter': 100},
+    )
+    return float(g_minus), float(res_hi.fun)
 
 
 # ============================================================================
@@ -66,6 +109,11 @@ class GeneralizedCovDenoiser:
     de_kwargs : dict or None
         Override / augment the kwargs passed to
         ``scipy.optimize.differential_evolution``.
+    device : {'auto', 'cpu', 'mps', 'cuda'}, default 'auto'
+        Where to run the SVD. ``'auto'`` picks Apple MPS if available, then
+        CUDA, then CPU. CPU uses ``np.linalg.svd`` (float64); MPS/CUDA uses
+        ``torch.linalg.svd`` (float32, much faster on large matrices). The
+        downstream optimisation runs on CPU regardless.
     """
 
     def __init__(
@@ -74,17 +122,56 @@ class GeneralizedCovDenoiser:
         beta_bracket: Tuple[float, float] = (0.01, 0.99),
         seed: int = 42,
         de_kwargs: Optional[dict] = None,
+        device: str = 'auto',
     ):
         self.a_bracket = tuple(a_bracket)
         self.beta_bracket = tuple(beta_bracket)
         self.seed = int(seed)
         self.de_kwargs = dict(de_kwargs or {})
+        self.device = str(device)
         self._info: dict = {}
         self.a: float = float('nan')
         self.beta: float = float('nan')
         self.rank: int = 0
         self.sigma2: float = 0.0
         self.psnr_test: float = float('nan')
+
+    # ------------------------------------------------------------------
+    # Internal: GPU / CPU SVD
+    # ------------------------------------------------------------------
+
+    def _resolve_device(self) -> str:
+        d = self.device.lower()
+        if d == 'cpu':
+            return 'cpu'
+        try:
+            import torch
+        except ImportError:
+            return 'cpu'
+        if d == 'mps':
+            return 'mps' if torch.backends.mps.is_available() else 'cpu'
+        if d == 'cuda':
+            return 'cuda' if torch.cuda.is_available() else 'cpu'
+        # auto
+        if torch.backends.mps.is_available():
+            return 'mps'
+        if torch.cuda.is_available():
+            return 'cuda'
+        return 'cpu'
+
+    def _svd(self, X_centered: np.ndarray):
+        dev = self._resolve_device()
+        if dev == 'cpu':
+            U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
+            return U_full, svs_full, Vt_full, 'cpu'
+        # GPU path via torch
+        import torch
+        Xt = torch.from_numpy(X_centered.astype(np.float32)).to(dev)
+        Ut, st, Vht = torch.linalg.svd(Xt, full_matrices=False)
+        U_full = Ut.cpu().numpy().astype(np.float64)
+        svs_full = st.cpu().numpy().astype(np.float64)
+        Vt_full = Vht.cpu().numpy().astype(np.float64)
+        return U_full, svs_full, Vt_full, dev
 
     # ------------------------------------------------------------------
     # Post-processing helpers
@@ -167,12 +254,11 @@ class GeneralizedCovDenoiser:
                 f"clean shape {clean_2d.shape} does not match images {(H, W)}"
             )
 
-        # Centre and SVD. Use np.linalg.svd directly (no dual-eigh path) for
-        # bit-for-bit consistency with the in-app best_a_beta CPU path.
+        # Centre then SVD (CPU float64 or GPU float32 — same algorithm).
         X = images_to_matrix(images)               # (p, n)
         x_mean = np.mean(X, axis=1, keepdims=True)
         X_centered = X - x_mean
-        U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
+        U_full, svs_full, Vt_full, used_device = self._svd(X_centered)
         pos = svs_full > 1e-5
         U = U_full[:, pos]
         svs = svs_full[pos]
@@ -206,8 +292,7 @@ class GeneralizedCovDenoiser:
                 if Lk < 2:
                     return m, 0.0
                 gamma_k = Lk / float(n)
-                g_lo = compute_G_minus(a_j, b_j, gamma_k)
-                g_hi = compute_G_plus(a_j, b_j, gamma_k)
+                g_lo, g_hi = _g_edges(a_j, b_j, gamma_k)
                 W_k = max(float(g_hi) - float(g_lo), 1e-15)
                 tail_sum = tot - (csum[k - 1] if k > 0 else 0.0)
                 lam_k1 = float(lam[k])
@@ -289,9 +374,54 @@ class GeneralizedCovDenoiser:
             "test_index": int(test_index),
             "n_evals": int(n_evals[0]),
             "y": y, "p": p, "n": n,
+            "device": used_device,
             "method": "best_a_beta_oracle",
         }
+        print(f"[rmt-denoise] â={self.a:.6f}  β̂={self.beta:.6f}  "
+              f"r̂={self.rank}  σ̂²={self.sigma2:.6g}  "
+              f"PSNR={self.psnr_test:.4f} dB  device={used_device}",
+              flush=True)
         return denoised
+
+    # ------------------------------------------------------------------
+    # Train + target convenience
+    # ------------------------------------------------------------------
+
+    def denoise_test(
+        self,
+        train_images: np.ndarray,
+        test_noisy: np.ndarray,
+        test_clean: np.ndarray,
+    ) -> np.ndarray:
+        """Denoise a single test (target) image given a stack of training images.
+
+        Parameters
+        ----------
+        train_images : np.ndarray, shape (n_train, H, W)
+            Noisy training images.
+        test_noisy : np.ndarray, shape (H, W)
+            The noisy target image to denoise.
+        test_clean : np.ndarray, shape (H, W)
+            Clean ground-truth reference for the target — drives the
+            differential-evolution search over (a, β).
+
+        Returns
+        -------
+        denoised_test : np.ndarray, shape (H, W)
+            The denoised target image (post-T, post-color-resize).
+        """
+        if train_images.ndim != 3:
+            raise ValueError(f"train_images must be (n, H, W); got {train_images.shape}")
+        if test_noisy.ndim != 2:
+            raise ValueError(f"test_noisy must be (H, W); got {test_noisy.shape}")
+        if test_clean.shape != test_noisy.shape:
+            raise ValueError("test_clean and test_noisy must have the same shape")
+        stack = np.concatenate(
+            [train_images.astype(np.float64), test_noisy.astype(np.float64)[None, :, :]],
+            axis=0,
+        )
+        out = self.denoise(stack, clean=test_clean.astype(np.float64), test_index=-1)
+        return out[-1]
 
     # ------------------------------------------------------------------
     # Folder convenience

@@ -16,7 +16,7 @@ Usage:
     denoised = gc.denoise(noisy_images)
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 from .mp_law import MPLawDenoiser
 from .generalized_cov import GeneralizedCovDenoiser

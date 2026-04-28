@@ -54,6 +54,33 @@ denoised = gc.denoise(noisy_stack, clean=clean_test, test_index=-1)
 
 The test column at `test_index` drives the (a, β) search; the rest of the stack is reconstructed at the same chosen rank with the same post-processing.
 
+### Train + target convenience
+
+```python
+# train: (n_train, H, W) noisy   test_noisy: (H, W)   test_clean: (H, W)
+gc = GeneralizedCovDenoiser()
+denoised_test = gc.denoise_test(train, test_noisy, test_clean)   # (H, W)
+print(gc.a, gc.beta, gc.rank, gc.psnr_test)
+```
+
+### GPU acceleration
+
+`device='auto'` (default) picks Apple MPS, then CUDA, then CPU. CPU runs
+`np.linalg.svd` in float64; MPS / CUDA runs `torch.linalg.svd` in float32.
+The downstream optimisation runs on CPU regardless of `device`.
+
+```python
+gc = GeneralizedCovDenoiser(device='mps')   # Apple Silicon
+gc = GeneralizedCovDenoiser(device='cuda')  # NVIDIA
+gc = GeneralizedCovDenoiser(device='cpu')   # force CPU (slower, float64)
+```
+
+After every `.denoise()` call the lib prints the chosen `(â, β̂, r̂, σ̂², PSNR, device)` to stdout. The same fields are available as attributes on the denoiser:
+
+```python
+gc.a, gc.beta, gc.rank, gc.sigma2, gc.psnr_test
+```
+
 ### MPLawDenoiser
 
 Standard Marčenko–Pastur baseline, no oracle search:
@@ -90,15 +117,17 @@ GeneralizedCovDenoiser(
     beta_bracket=(0.01, 0.99),
     seed=42,
     de_kwargs=None,
+    device='auto',     # 'auto' | 'cpu' | 'mps' | 'cuda'
 )
 ```
 
 | Method / attribute | Description |
 |---|---|
 | `.denoise(images, clean, test_index=-1)` | Run on a noisy `(n, H, W)` stack with a clean `(H, W)` reference for the test column. Returns the reconstructed stack. |
+| `.denoise_test(train, test_noisy, test_clean)` | Single-target convenience: returns the denoised `(H, W)` test image given `(n_train, H, W)` training stack. |
 | `.denoise_folder(folder, n_train, test, size=None, noise_fn=None, seed=42)` | End-to-end: load a folder, split into train + test, optionally inject noise, denoise. Returns `(denoised, clean, noisy, names)`. |
 | `.a`, `.beta`, `.rank`, `.sigma2`, `.psnr_test` | Selected parameters from the most recent run. |
-| `.info` | Full diagnostic dict (`a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `y`, `p`, `n`, `method='best_a_beta_oracle'`). |
+| `.info` | Full diagnostic dict (`a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `y`, `p`, `n`, `device`, `method='best_a_beta_oracle'`). |
 
 ### `MPLawDenoiser(sigma2=None)`
 
