@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.log
+launch_debug.txt
+launch_stderr.txt

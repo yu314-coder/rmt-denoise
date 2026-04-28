@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rmt-denoise"
+version = "1.0.3"
+description = "Image denoising via Random Matrix Theory: M-P Law and Generalized Covariance Matrix"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Yu Yao-Hsing", email = "euler314@example.com"},
+]
+keywords = ["denoising", "random-matrix-theory", "marcenko-pastur", "PCA", "image-processing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+images = ["Pillow>=8.0"]
+metrics = ["lpips>=0.1", "torch>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/yu314-coder"
+Documentation = "https://huggingface.co/spaces/euler314"
+
+[tool.setuptools.packages.find]
+include = ["rmt_denoise*"]
