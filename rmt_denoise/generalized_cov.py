@@ -376,6 +376,11 @@ class GeneralizedCovDenoiser:
             "y": y, "p": p, "n": n,
             "device": used_device,
             "method": "best_a_beta_oracle",
+            # Aliases so callers expecting the canonical-spec key names
+            # (â / β̂ / P̂) can read them without remapping.
+            "a_hat": self.a,
+            "beta_hat": self.beta,
+            "P_hat": int(self.rank),
         }
         print(f"[rmt-denoise] â={self.a:.6f}  β̂={self.beta:.6f}  "
               f"r̂={self.rank}  σ̂²={self.sigma2:.6g}  "
