@@ -127,20 +127,51 @@ class GeneralizedCovDenoiser:
     """
 
     def __init__(self, sigma2=None, a=None, beta=None, mode="multi",
-                 candidate_k=None, stride_ratio=0.5):
+                 candidate_k=None, stride_ratio=0.5,
+                 apply_t=True, color_resize=True):
         self._sigma2_given = sigma2
         self._a_given = a
         self._beta_given = beta
         self.mode = mode
         self.candidate_k = candidate_k
         self.stride_ratio = stride_ratio
+        # Post-processing defaults (best_a_beta route).
+        self.apply_t = apply_t
+        self.color_resize = color_resize
         self._info = {}
+
+    # ------------------------------------------------------------------
+    # Post-processing helpers (matches denoise app's best_a_beta route)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_T_diag(img2d, a, beta):
+        """Multiply image by diagonal T whose first ⌊p·β⌋ entries are √a
+        and the remaining are 1 (p = H·W). Returns a clipped copy in [0, 1]."""
+        a = float(max(a, 0.0)); beta = float(min(max(beta, 0.0), 1.0))
+        flat = np.asarray(img2d, dtype=np.float64).ravel()
+        p = flat.size
+        k = int(round(p * beta))
+        if k > 0:
+            flat = flat.copy()
+            flat[:k] = flat[:k] * np.sqrt(a)
+        return np.clip(flat.reshape(img2d.shape), 0.0, 1.0)
+
+    @staticmethod
+    def _color_resize(img2d):
+        """y = (x − min(x)) / max(x_before_subtract), clipped to [0, 1]."""
+        x = np.asarray(img2d, dtype=np.float64)
+        x_max = float(x.max()) if x.size else 0.0
+        if x_max <= 0.0:
+            return np.clip(x, 0.0, 1.0)
+        y = (x - float(x.min())) / x_max
+        return np.clip(y, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def denoise(self, images):
+    def denoise(self, images, clean=None, test_index=-1):
         """Denoise images.
 
         Parameters
@@ -148,6 +179,23 @@ class GeneralizedCovDenoiser:
         images : np.ndarray
             If ``mode='multi'``: shape (n, H, W).
             If ``mode='patch'``: shape (H, W) -- single image.
+        clean : np.ndarray or None, optional
+            Ground-truth clean reference for ORACLE mode (mode='multi' only).
+            When provided as shape (H, W), enables the *best_a_beta* route:
+            jointly optimise (a, β) via SciPy's ``differential_evolution`` to
+            maximise PSNR of the denoised test image (default = last column of
+            *images*) against the clean reference. The post-processing chain
+            applied during the search and on the final output is:
+
+                projection (rank r̂) → centering re-add (X̄)
+                → clip to [0, 1] → T(a, β)  (if apply_t)
+                → color_resize           (if color_resize)
+
+            When ``clean`` is None, falls back to the auto-estimation route.
+        test_index : int, optional
+            Which column of *images* is treated as the test image during the
+            oracle PSNR objective. Default = ``-1`` (last column). Ignored
+            unless ``clean`` is provided.
 
         Returns
         -------
@@ -156,6 +204,8 @@ class GeneralizedCovDenoiser:
         """
         if self.mode == "patch":
             return self._denoise_patch(images)
+        if clean is not None:
+            return self._denoise_multi_oracle(images, clean, test_index)
         return self._denoise_multi(images)
 
     @property
@@ -314,6 +364,169 @@ class GeneralizedCovDenoiser:
             "n_intervals": len(support_intervals),
         }
 
+        return denoised
+
+    # ------------------------------------------------------------------
+    # Workflow A (oracle, best_a_beta): differential_evolution over (a, β)
+    # ------------------------------------------------------------------
+
+    def _denoise_multi_oracle(self, images, clean, test_index=-1):
+        """Best (a, β) by differential_evolution, using the clean reference
+        to maximise PSNR. Reconstructs every column with the chosen rank
+        and applies the same post-processing (T, color_resize) used during
+        the search to ALL columns of the output.
+        """
+        from scipy.optimize import differential_evolution
+
+        n_images, H, W = images.shape
+        p = H * W
+        n = n_images
+        y = p / n
+        if test_index < 0:
+            test_index += n
+
+        # Always center for the gen-cov route.
+        X = images_to_matrix(images)               # (p, n)
+        x_mean = np.mean(X, axis=1, keepdims=True)
+        X_centered = X - x_mean
+
+        # SVD once. Use dual when p > n.
+        if p > n:
+            G = (X_centered.T @ X_centered) / n
+            eigvals, V = np.linalg.eigh(G)
+            idx = np.argsort(eigvals)[::-1]
+            eigvals = eigvals[idx]
+            V = V[:, idx]
+            pos = eigvals > 1e-10
+            svs = np.sqrt(n * eigvals[pos])
+            U = (X_centered @ V[:, pos]) / svs
+            Vt = V[:, pos].T
+            lam = eigvals[pos]
+        else:
+            U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
+            pos = svs_full > 1e-5
+            U = U_full[:, pos]
+            svs = svs_full[pos]
+            Vt = Vt_full[pos, :]
+            lam = (svs ** 2) / n
+
+        m = len(lam)
+        kmax = m - 1
+        csum = np.cumsum(lam)
+        tot = float(csum[-1])
+        lam_end = float(lam[-1])
+        n_train = n  # all columns used as the training set
+
+        x_test_centered = X_centered[:, test_index]
+        clean_2d = np.asarray(clean, dtype=np.float64)
+        x_mean_flat = x_mean.ravel()
+
+        # Per-rank projection cache (rank → centered projection of test col)
+        dv_cache = {}
+
+        def _proj(r):
+            if r in dv_cache:
+                return dv_cache[r]
+            if r <= 0 or r >= m:
+                dv = np.zeros_like(x_test_centered)
+            else:
+                Ur = U[:, :r]
+                dv = Ur @ (Ur.T @ x_test_centered)
+            dv_cache[r] = dv
+            return dv
+
+        def _r_sigma2(a_j, b_j):
+            """Smallest k satisfying the gen-cov acceptance test at (a, β)."""
+            for k in range(0, kmax + 1):
+                Lk = m - k
+                if Lk < 2:
+                    return m, 0.0
+                gamma_k = Lk / float(n_train)
+                g_lo, g_hi = compute_G_minus(a_j, b_j, gamma_k), compute_G_plus(a_j, b_j, gamma_k)
+                W_k = max(float(g_hi) - float(g_lo), 1e-15)
+                tail_sum = tot - (csum[k - 1] if k > 0 else 0.0)
+                lam_k1 = float(lam[k])
+                if lam_k1 <= lam_end:
+                    return m, 0.0
+                sigma2_k = max((lam_k1 - lam_end) / W_k, 1e-30)
+                if tail_sum >= Lk * sigma2_k:
+                    return k, sigma2_k
+            return m, 0.0
+
+        THETA_LO, THETA_HI = float(np.log(0.01)), float(np.log(1.0))
+        BETA_LO, BETA_HI = 0.01, 0.99
+
+        best = {'psnr': -1e30, 'a': float('nan'), 'b': float('nan'),
+                'r': 0, 'sigma2': 0.0}
+        n_evals = [0]
+
+        def _neg_psnr(theta):
+            n_evals[0] += 1
+            t_a = float(np.clip(theta[0], THETA_LO, THETA_HI))
+            b_j = float(np.clip(theta[1], BETA_LO, BETA_HI))
+            a_j = float(np.exp(t_a))
+            chosen_k, sig2 = _r_sigma2(a_j, b_j)
+            r_a = chosen_k if chosen_k < m else 0
+            dv = _proj(r_a)
+            dv_full = dv + x_mean_flat
+            img = np.clip(dv_full.reshape(H, W), 0.0, 1.0)
+            if self.apply_t:
+                img = self._apply_T_diag(img, a_j, b_j)
+            if self.color_resize:
+                img = self._color_resize(img)
+            mse = float(np.mean((clean_2d - img) ** 2))
+            psnr = (10.0 * np.log10(1.0 / mse)) if mse > 0 else 99.0
+            if psnr > best['psnr']:
+                best.update(psnr=psnr, a=a_j, b=b_j, r=r_a, sigma2=sig2)
+            return -psnr
+
+        try:
+            differential_evolution(
+                _neg_psnr,
+                bounds=[(THETA_LO, THETA_HI), (BETA_LO, BETA_HI)],
+                strategy='best1bin', popsize=20, mutation=(0.5, 1.5),
+                recombination=0.7, tol=1e-4, maxiter=80, seed=42,
+                polish=True, init='sobol',
+            )
+        except Exception:
+            pass
+
+        a_hat = best['a'] if np.isfinite(best['a']) else 1.0
+        beta_hat = best['b'] if np.isfinite(best['b']) else 0.99
+        rank = int(best['r'])
+        sigma2_hat = float(best['sigma2'])
+
+        # Reconstruct ALL columns at the chosen rank, then apply the same
+        # post-processing the optimiser used to score the test column.
+        if rank > 0:
+            shrunk = np.zeros_like(svs)
+            shrunk[:min(rank, len(svs))] = svs[:min(rank, len(svs))]
+            X_rec = (U * shrunk) @ Vt
+        else:
+            X_rec = np.zeros_like(X_centered)
+        X_rec = X_rec + x_mean
+        denoised = matrix_to_images(X_rec, H, W)
+        denoised = np.clip(denoised, 0.0, 1.0)
+        if self.apply_t or self.color_resize:
+            for i in range(denoised.shape[0]):
+                if self.apply_t:
+                    denoised[i] = self._apply_T_diag(denoised[i], a_hat, beta_hat)
+                if self.color_resize:
+                    denoised[i] = self._color_resize(denoised[i])
+
+        self._info = {
+            "a": float(a_hat),
+            "beta": float(beta_hat),
+            "sigma2": sigma2_hat,
+            "rank": rank,
+            "psnr_test": float(best['psnr']),
+            "test_index": int(test_index),
+            "n_evals": int(n_evals[0]),
+            "y": y, "p": p, "n": n,
+            "method": "best_a_beta_oracle",
+            "apply_t": bool(self.apply_t),
+            "color_resize": bool(self.color_resize),
+        }
         return denoised
 
     # ------------------------------------------------------------------
