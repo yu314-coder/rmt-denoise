@@ -26,7 +26,7 @@ cd rmt-denoise && pip install -e .[images]
 ```python
 from rmt_denoise import GeneralizedCovDenoiser, add_gaussian_noise
 
-gc = GeneralizedCovDenoiser()                       # apply_t & color_resize on by default
+gc = GeneralizedCovDenoiser()    # always centres + T(a, β) + color-resize
 denoised, clean, noisy, names = gc.denoise_folder(
     folder      = "path/to/images",                 # folder of (H, W) images
     n_train     = 300,                              # 300 training images (0 = use all)
@@ -34,10 +34,11 @@ denoised, clean, noisy, names = gc.denoise_folder(
     size        = (100, 100),                       # resize on load (optional)
     noise_fn    = lambda imgs: add_gaussian_noise(imgs, sigma=0.04),
 )
-print(gc.info)
-# {'a': 0.27, 'beta': 0.95, 'sigma2': ..., 'rank': 12,
-#  'psnr_test': 34.5, 'method': 'best_a_beta_oracle', ...}
+print(gc.a, gc.beta, gc.rank, gc.psnr_test)
+# 0.27  0.95  12  34.5
 ```
+
+The chosen `(a, β)` are exposed as direct attributes (`gc.a`, `gc.beta`, `gc.rank`, `gc.sigma2`, `gc.psnr_test`); the full diagnostic dict is still in `gc.info`.
 
 `denoised` is the full `(n_train+1, H, W)` reconstructed stack — the test image lives at index `-1`. `clean` and `noisy` are the (clean / noisy) versions of that test image, returned for convenience.
 
@@ -77,11 +78,7 @@ End-to-end:
 
 `color_resize` rescales each image as `y = (x − min(x)) / max(x_before_subtract)` and clips to `[0, 1]`.
 
-Disable either step via constructor flags:
-
-```python
-gc = GeneralizedCovDenoiser(apply_t=False, color_resize=False)
-```
+Both steps are part of the algorithm and are always applied — there are no flags to disable them.
 
 ## API Reference
 
@@ -89,8 +86,6 @@ gc = GeneralizedCovDenoiser(apply_t=False, color_resize=False)
 
 ```python
 GeneralizedCovDenoiser(
-    apply_t=True,
-    color_resize=True,
     a_bracket=(0.01, 1.0),
     beta_bracket=(0.01, 0.99),
     seed=42,
@@ -98,11 +93,12 @@ GeneralizedCovDenoiser(
 )
 ```
 
-| Method | Description |
+| Method / attribute | Description |
 |---|---|
 | `.denoise(images, clean, test_index=-1)` | Run on a noisy `(n, H, W)` stack with a clean `(H, W)` reference for the test column. Returns the reconstructed stack. |
 | `.denoise_folder(folder, n_train, test, size=None, noise_fn=None, seed=42)` | End-to-end: load a folder, split into train + test, optionally inject noise, denoise. Returns `(denoised, clean, noisy, names)`. |
-| `.info` | `dict` with `a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `y`, `p`, `n`, `apply_t`, `color_resize`, `method='best_a_beta_oracle'`. |
+| `.a`, `.beta`, `.rank`, `.sigma2`, `.psnr_test` | Selected parameters from the most recent run. |
+| `.info` | Full diagnostic dict (`a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `y`, `p`, `n`, `method='best_a_beta_oracle'`). |
 
 ### `MPLawDenoiser(sigma2=None)`
 

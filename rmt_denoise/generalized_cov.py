@@ -49,14 +49,14 @@ class GeneralizedCovDenoiser:
 
     Model: B_n = S_n T_n  with  H = β·δ_a + (1−β)·δ_1.
 
+    The pipeline always:
+
+      * centres the data (X̃ = X − X̄),
+      * applies T(a, β) = diag(√a, ..., √a, 1, ..., 1) with ⌊p·β⌋ √a entries,
+      * applies the color-resize ``y = (x − min(x)) / max(x_before_subtract)``.
+
     Parameters
     ----------
-    apply_t : bool, default True
-        Multiply each reconstructed image by a diagonal T whose first ⌊p·β⌋
-        entries are √a and the remaining are 1 (p = H·W).
-    color_resize : bool, default True
-        Rescale each reconstructed image as
-        ``y = (x − min(x)) / max(x_before_subtract)`` then clip to [0, 1].
     a_bracket : (float, float), default (0.01, 1.0)
         Search range for the population mass location ``a`` (linear scale).
     beta_bracket : (float, float), default (0.01, 0.99)
@@ -70,20 +70,21 @@ class GeneralizedCovDenoiser:
 
     def __init__(
         self,
-        apply_t: bool = True,
-        color_resize: bool = True,
         a_bracket: Tuple[float, float] = (0.01, 1.0),
         beta_bracket: Tuple[float, float] = (0.01, 0.99),
         seed: int = 42,
         de_kwargs: Optional[dict] = None,
     ):
-        self.apply_t = bool(apply_t)
-        self.color_resize = bool(color_resize)
         self.a_bracket = tuple(a_bracket)
         self.beta_bracket = tuple(beta_bracket)
         self.seed = int(seed)
         self.de_kwargs = dict(de_kwargs or {})
         self._info: dict = {}
+        self.a: float = float('nan')
+        self.beta: float = float('nan')
+        self.rank: int = 0
+        self.sigma2: float = 0.0
+        self.psnr_test: float = float('nan')
 
     # ------------------------------------------------------------------
     # Post-processing helpers
@@ -166,28 +167,17 @@ class GeneralizedCovDenoiser:
                 f"clean shape {clean_2d.shape} does not match images {(H, W)}"
             )
 
-        # Centre and SVD.
+        # Centre and SVD. Use np.linalg.svd directly (no dual-eigh path) for
+        # bit-for-bit consistency with the in-app best_a_beta CPU path.
         X = images_to_matrix(images)               # (p, n)
         x_mean = np.mean(X, axis=1, keepdims=True)
         X_centered = X - x_mean
-        if p > n:
-            G = (X_centered.T @ X_centered) / n
-            eigvals, V = np.linalg.eigh(G)
-            idx = np.argsort(eigvals)[::-1]
-            eigvals = eigvals[idx]
-            V = V[:, idx]
-            pos = eigvals > 1e-10
-            svs = np.sqrt(n * eigvals[pos])
-            U = (X_centered @ V[:, pos]) / svs
-            Vt = V[:, pos].T
-            lam = eigvals[pos]
-        else:
-            U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
-            pos = svs_full > 1e-5
-            U = U_full[:, pos]
-            svs = svs_full[pos]
-            Vt = Vt_full[pos, :]
-            lam = (svs ** 2) / n
+        U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
+        pos = svs_full > 1e-5
+        U = U_full[:, pos]
+        svs = svs_full[pos]
+        Vt = Vt_full[pos, :]
+        lam = (svs ** 2) / n
 
         m = len(lam)
         kmax = m - 1
@@ -246,10 +236,8 @@ class GeneralizedCovDenoiser:
             dv = _proj(r_a)
             dv_full = dv + x_mean_flat
             img = np.clip(dv_full.reshape(H, W), 0.0, 1.0)
-            if self.apply_t:
-                img = self._apply_T_diag(img, a_j, b_j)
-            if self.color_resize:
-                img = self._color_resize(img)
+            img = self._apply_T_diag(img, a_j, b_j)
+            img = self._color_resize(img)
             mse = float(np.mean((clean_2d - img) ** 2))
             psnr = (10.0 * np.log10(1.0 / mse)) if mse > 0 else 99.0
             if psnr > best['psnr']:
@@ -283,25 +271,25 @@ class GeneralizedCovDenoiser:
         X_rec = X_rec + x_mean
         denoised = matrix_to_images(X_rec, H, W)
         denoised = np.clip(denoised, 0.0, 1.0)
-        if self.apply_t or self.color_resize:
-            for i in range(denoised.shape[0]):
-                if self.apply_t:
-                    denoised[i] = self._apply_T_diag(denoised[i], a_hat, beta_hat)
-                if self.color_resize:
-                    denoised[i] = self._color_resize(denoised[i])
+        for i in range(denoised.shape[0]):
+            denoised[i] = self._apply_T_diag(denoised[i], a_hat, beta_hat)
+            denoised[i] = self._color_resize(denoised[i])
 
+        self.a = float(a_hat)
+        self.beta = float(beta_hat)
+        self.rank = int(rank)
+        self.sigma2 = float(sigma2_hat)
+        self.psnr_test = float(best['psnr'])
         self._info = {
-            "a": float(a_hat),
-            "beta": float(beta_hat),
-            "sigma2": sigma2_hat,
-            "rank": rank,
-            "psnr_test": float(best['psnr']),
+            "a": self.a,
+            "beta": self.beta,
+            "sigma2": self.sigma2,
+            "rank": self.rank,
+            "psnr_test": self.psnr_test,
             "test_index": int(test_index),
             "n_evals": int(n_evals[0]),
             "y": y, "p": p, "n": n,
             "method": "best_a_beta_oracle",
-            "apply_t": bool(self.apply_t),
-            "color_resize": bool(self.color_resize),
         }
         return denoised
 
