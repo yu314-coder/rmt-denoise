@@ -1,303 +1,170 @@
 # rmt-denoise
 
-**Image denoising via Random Matrix Theory** -- two methods that automatically separate signal from noise using eigenvalue analysis.
+**Image denoising via Random Matrix Theory** — automatically pick the best generalized-covariance parameters `(a, β)` for every test image and reconstruct it.
 
 | Method | Best for | Parameters |
 |---|---|---|
-| `MPLawDenoiser` | i.i.d. Gaussian noise | auto-estimates sigma |
-| `GeneralizedCovDenoiser` | Heteroscedastic / structured noise | auto-estimates (a, beta, sigma) |
+| `MPLawDenoiser` | i.i.d. Gaussian noise | auto-estimates σ |
+| `GeneralizedCovDenoiser` | Heteroscedastic / structured noise | **oracle search** for `(a, β)` |
 
 ## Installation
 
 ```bash
-pip install rmt-denoise
+pip install rmt-denoise[images]   # `images` extra pulls in Pillow for load_folder
 ```
 
 Or from source:
 ```bash
-cd de-noise
-pip install -e .
+git clone https://github.com/yu314-coder/rmt-denoise.git
+cd rmt-denoise && pip install -e .[images]
 ```
 
 ## Quick Start
 
-Two ways to use — same algorithm, just different input:
-
-### Option A: Multiple images (e.g. 100 photos of the same scene)
+`GeneralizedCovDenoiser` runs a single workflow: pick a folder of images, choose how many to use for training, choose which one to denoise, and the denoiser jointly optimises `(a, β)` via `differential_evolution` to maximise PSNR of that test image.
 
 ```python
-import numpy as np
 from rmt_denoise import GeneralizedCovDenoiser, add_gaussian_noise
 
-# n noisy images of the same scene, shape (n, H, W), values in [0, 1]
-noisy_images = ...  # your data
-
-gc = GeneralizedCovDenoiser()
-denoised = gc.denoise(noisy_images)  # (n, H, W) -> (n, H, W)
-print(gc.info)  # {'a': 4.29, 'beta': 0.148, 'sigma2': 0.0096, 'rank': 0, ...}
-```
-
-### Option B: One image, used multiple times (split into patches internally)
-
-```python
-from rmt_denoise import GeneralizedCovDenoiser
-
-# Single noisy image, shape (H, W), values in [0, 1]
-noisy_image = ...  # your data
-
-gc = GeneralizedCovDenoiser(mode='patch')
-denoised = gc.denoise(noisy_image)  # (H, W) -> (H, W)
-print(gc.info)  # {'best_k': 16, 'a': 3.5, 'beta': 0.1, ...}
-```
-
-### Option C: Oracle best (a, β) via differential evolution (v1.1+)
-
-When you have a **clean ground-truth reference** (synthetic benchmarks, MRI phantoms, oracle evaluation), pass it to `denoise()` to switch on the oracle path. The denoiser jointly optimises `(a, β)` via SciPy's `differential_evolution` to maximise PSNR vs the clean reference, then applies the resulting `T(a, β)` diagonal scaling and a color-resize step to every reconstructed image.
-
-```python
-from rmt_denoise import GeneralizedCovDenoiser
-
-noisy_images = ...     # (n, H, W)
-clean_test_image = ... # (H, W) — ground truth for ONE column of `noisy_images`
-
-gc = GeneralizedCovDenoiser(mode='multi', apply_t=True, color_resize=True)
-denoised = gc.denoise(noisy_images, clean=clean_test_image, test_index=-1)
+gc = GeneralizedCovDenoiser()                       # apply_t & color_resize on by default
+denoised, clean, noisy, names = gc.denoise_folder(
+    folder      = "path/to/images",                 # folder of (H, W) images
+    n_train     = 300,                              # 300 training images (0 = use all)
+    test        = "s12_1.png",                      # one filename — or an integer index
+    size        = (100, 100),                       # resize on load (optional)
+    noise_fn    = lambda imgs: add_gaussian_noise(imgs, sigma=0.04),
+)
 print(gc.info)
 # {'a': 0.27, 'beta': 0.95, 'sigma2': ..., 'rank': 12,
 #  'psnr_test': 34.5, 'method': 'best_a_beta_oracle', ...}
 ```
 
-What it does, end-to-end:
+`denoised` is the full `(n_train+1, H, W)` reconstructed stack — the test image lives at index `-1`. `clean` and `noisy` are the (clean / noisy) versions of that test image, returned for convenience.
 
-1. Centres the data: `X̃ = X − X̄` (always).
-2. Computes the SVD once (uses dual when p > n).
-3. Runs `differential_evolution` over `(log a, β)` with `a ∈ [0.01, 1.0]`, `β ∈ [0.01, 0.99]` (popsize 20, Sobol init, `seed=42`, polish on).
-4. For each candidate `(a, β)`: gen-cov acceptance test → rank `r̂` → cached projection → centring re-add → clip → `T(a, β)` (diag √a/1) → color-resize → PSNR vs `clean`.
-5. Returns the full reconstruction at the best rank, with `T` and color-resize applied to every column.
+### Lower-level API (already have an in-memory stack)
 
-Pass `apply_t=False` and/or `color_resize=False` to disable those post-processing steps.
+```python
+from rmt_denoise import GeneralizedCovDenoiser
 
-Both options also work with `MPLawDenoiser`:
+# noisy_stack: (n, H, W)   clean_test: (H, W)
+gc = GeneralizedCovDenoiser()
+denoised = gc.denoise(noisy_stack, clean=clean_test, test_index=-1)
+```
+
+The test column at `test_index` drives the (a, β) search; the rest of the stack is reconstructed at the same chosen rank with the same post-processing.
+
+### MPLawDenoiser
+
+Standard Marčenko–Pastur baseline, no oracle search:
 
 ```python
 from rmt_denoise import MPLawDenoiser
-
 mp = MPLawDenoiser()
-denoised = mp.denoise(noisy_images)  # multi-image
-# or
-mp = MPLawDenoiser(mode='patch')
-denoised = mp.denoise(noisy_image)   # single-image patch split
+denoised = mp.denoise(noisy_images)        # (n, H, W) -> (n, H, W)
 ```
 
-## How It Works
+## How `GeneralizedCovDenoiser` works
 
-Both methods follow the same pipeline:
+End-to-end:
 
+1. **Centre** the data: `X̃ = X − X̄`.
+2. **SVD once** (uses dual when `p > n`).
+3. **`scipy.optimize.differential_evolution`** over `(log a, β)` with bounds `a ∈ [0.01, 1.0]`, `β ∈ [0.01, 0.99]`. Default settings: `popsize=20`, Sobol init, `seed=42`, `polish=True`.
+4. **Per-candidate evaluation**: gen-cov acceptance test → rank `r̂` → cached projection → centring re-add → clip → `T(a, β)` → color-resize → PSNR vs clean.
+5. **Reconstruct every column** at the best rank, applying the same `T` and color-resize to all of them.
+
+`T(a, β)` is the diagonal matrix whose first `⌊p·β⌋` entries are `√a` and the rest are `1` (`p = H·W`); it embeds the noise-model scaling `H = β·δ_a + (1 − β)·δ_1` directly into the post-processed image.
+
+`color_resize` rescales each image as `y = (x − min(x)) / max(x_before_subtract)` and clips to `[0, 1]`.
+
+Disable either step via constructor flags:
+
+```python
+gc = GeneralizedCovDenoiser(apply_t=False, color_resize=False)
 ```
-Noisy images -> Vectorize -> PCA (SVD) -> Estimate noise -> Threshold eigenvalues -> Reconstruct
-```
-
-### Step 1: Data Matrix
-
-Given `n` grayscale images of size `H x W`, vectorize each into a column of length `p = H*W`:
-
-```
-X = [x_1 | x_2 | ... | x_n]    shape: (p, n)
-```
-
-The sample covariance matrix is `S = (1/n) X X^T`.
-
-### Step 2: Eigenvalue Analysis
-
-When `p > n` (typical), compute the dual `(1/n) X^T X` instead (n x n, much faster).
-The key ratio is **y = p/n** -- it controls the noise bulk width.
-
-### Step 3: Noise Threshold
-
-#### M-P Law Method
-
-The Marcenko-Pastur law states that for pure noise with variance sigma^2, the eigenvalues
-concentrate in:
-
-```
-[sigma^2 * (1 - sqrt(y))^2,  sigma^2 * (1 + sqrt(y))^2]
-```
-
-Everything above the upper edge `lambda_+ = sigma^2 * (1 + sqrt(y))^2` is signal.
-
-#### Generalized Covariance Method
-
-When noise is **heteroscedastic** (different variance in different directions), the standard M-P law
-is suboptimal. The generalized model uses:
-
-```
-H = beta * delta_a + (1 - beta) * delta_1
-```
-
-meaning a fraction `beta` of dimensions have noise variance `sigma^2 * a` and the rest have `sigma^2`.
-
-The noise eigenvalue support is bounded by the function:
-
-```
-g(t) = y*beta*(a-1)*t + (a*t+1)*((y-1)*t - 1)
-       -----------------------------------------
-               (a*t+1)*(t^2 + t)
-```
-
-The support bounds are:
-- **Lower edge**: `lambda_lower = sigma^2 * max_{t>0} g(t)`
-- **Upper edge**: `lambda_upper = sigma^2 * min_{-1/a < t < 0} g(t)`
-
-When `a = 1` or `beta = 0`, this reduces to the standard M-P law.
-
-#### Two-Interval Support (Delta < 0)
-
-The discriminant Delta (from the quartic P_4(t)) determines whether the noise eigenvalues
-form one or two disjoint intervals:
-
-- **Delta > 0**: Single interval `[lambda_lower, lambda_upper]`
-- **Delta < 0**: Two disjoint intervals with a **gap** -- eigenvalues in the gap are signal!
-
-This is the key advantage: the generalized method can detect signal that M-P would miss.
-
-### Step 4: Parameter Estimation
-
-The parameters `(a, beta, sigma^2)` are estimated automatically:
-
-1. **Provisional noise set**: use M-P threshold to identify likely-noise eigenvalues
-2. **Moment matching**: compute first 3 moments of the noise eigenvalues and solve for `(a, beta, sigma^2)`
-3. **Edge refinement**: iteratively adjust parameters to match the observed noise bulk edges
-
-### Step 5: Guarantee
-
-The generalized method **always keeps >= as many signal components as M-P**. If the generalized
-threshold is more aggressive, it falls back to the M-P threshold. This guarantees:
-
-```
-PSNR(GeneralizedCov) >= PSNR(MP)  (always)
-```
-
-## Two Input Modes
-
-The denoising algorithm is the same — only the input differs:
-
-| Mode | Input | How it works |
-|---|---|---|
-| **Multi-image** (default) | `n` images `(n, H, W)` | Each image is one column in the data matrix. Works best with multiple noisy copies of the same scene. |
-| **Patch-split** (`mode='patch'`) | 1 image `(H, W)` | Splits the image into `k x k` patches. Each patch becomes one column. Automatically picks the best `k`. |
-
-**When to use which:**
-
-- Have **multiple photos** of the same thing (e.g. burst mode, video frames, MRI slices)? Use **multi-image** mode.
-- Have **one photo** only? Use **patch-split** mode — the library splits it into overlapping patches, denoises, and reassembles.
 
 ## API Reference
+
+### `GeneralizedCovDenoiser`
+
+```python
+GeneralizedCovDenoiser(
+    apply_t=True,
+    color_resize=True,
+    a_bracket=(0.01, 1.0),
+    beta_bracket=(0.01, 0.99),
+    seed=42,
+    de_kwargs=None,
+)
+```
+
+| Method | Description |
+|---|---|
+| `.denoise(images, clean, test_index=-1)` | Run on a noisy `(n, H, W)` stack with a clean `(H, W)` reference for the test column. Returns the reconstructed stack. |
+| `.denoise_folder(folder, n_train, test, size=None, noise_fn=None, seed=42)` | End-to-end: load a folder, split into train + test, optionally inject noise, denoise. Returns `(denoised, clean, noisy, names)`. |
+| `.info` | `dict` with `a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `y`, `p`, `n`, `apply_t`, `color_resize`, `method='best_a_beta_oracle'`. |
 
 ### `MPLawDenoiser(sigma2=None)`
 
 | Method | Description |
 |---|---|
-| `.denoise(images)` | Denoise `(n, H, W)` array. Returns `(n, H, W)`. |
-| `.info` | Dict: `sigma2`, `threshold`, `rank`, `y`, `p`, `n` |
+| `.denoise(images)` | Denoise `(n, H, W)`. Returns `(n, H, W)`. |
+| `.info` | `sigma2`, `threshold`, `rank`, `y`, `p`, `n`. |
 
-### `GeneralizedCovDenoiser(sigma2=None, a=None, beta=None, mode='multi', candidate_k=None, stride_ratio=0.5, apply_t=True, color_resize=True)`
-
-| Method | Description |
-|---|---|
-| `.denoise(images, clean=None, test_index=-1)` | Denoise `(n, H, W)` or `(H, W)`. Returns same shape. When `clean` is supplied (mode='multi'), runs the oracle best (a, β) path via differential evolution and applies the chosen `T(a, β)` plus optional color-resize. |
-| `.info` | Auto path: `a`, `beta`, `sigma2`, `threshold`, `threshold_mp`, `rank`, `rank_mp`, `y`, `n_intervals`. Oracle path: `a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `apply_t`, `color_resize`, `method='best_a_beta_oracle'`. |
-
-Constructor flags new in **1.1.0**:
-- `apply_t` (default `True`) — multiply each reconstructed image by a diagonal `T` whose first ⌊p·β⌋ entries are √a and the rest are 1 (p = H·W).
-- `color_resize` (default `True`) — rescale each reconstructed image as `(x − min(x)) / max(x_before_subtract)` then clip to [0, 1].
-
-### Noise Utilities
+### Folder loaders
 
 ```python
-from rmt_denoise import add_gaussian_noise, add_structured_noise
+from rmt_denoise import load_folder, split_train_test
 
-noisy, variance = add_gaussian_noise(images, sigma=0.1)
-noisy, variance = add_structured_noise(images, a=5.0, beta=0.15, sigma=0.1)
+images, names = load_folder("path/", size=(H, W))            # (n, H, W) in [0, 1]
+train_imgs, test_img, n_train = split_train_test(
+    images, names, n_train=300, test="s12_1.png", seed=42,
+)
+```
+
+### Noise utilities
+
+```python
+from rmt_denoise import (
+    add_gaussian_noise, add_laplacian_noise,
+    add_mixture_gaussian_noise, add_structured_noise,
+)
 ```
 
 ### Metrics
 
 ```python
 from rmt_denoise import compute_psnr, compute_ssim
-
-psnr = compute_psnr(clean, denoised)  # dB
-ssim = compute_ssim(clean, denoised)  # [-1, 1]
+psnr = compute_psnr(clean, denoised)   # dB
+ssim = compute_ssim(clean, denoised)   # [-1, 1]
 ```
-
-## Benchmarks
-
-### Same-scene (500 copies of 1 real photo, y=20)
-
-| Noise | sigma | MP (dB) | Gen (dB) | Gen - MP |
-|---|---|---|---|---|
-| Gaussian | 15 | 28.4 | **51.6** | **+23.2** |
-| Gaussian | 30 | 22.6 | **44.9** | **+22.3** |
-| Structured | 15 | 25.5 | **49.5** | **+24.0** |
-| Structured | 25 | 21.6 | **43.7** | **+22.0** |
-| Structured | 40 | 18.5 | **35.7** | **+17.2** |
-| Mixture | 20 | 26.8 | **47.8** | **+21.0** |
-| Laplacian | 20 | 27.0 | **48.9** | **+22.0** |
-
-**Result: Generalized Covariance wins 56/56 tests (100%), avg +16.2 dB**
-
-### Typhoon satellite images (100 different frames, y=100)
-
-| Noise | sigma | MP (dB) | Gen (dB) | Gen - MP |
-|---|---|---|---|---|
-| Gaussian | 10 | 27.1 | **30.9** | **+3.8** |
-| Structured | 10 | 26.9 | **29.3** | **+2.4** |
-| Laplacian | 15 | 26.8 | **28.4** | **+1.6** |
-
-**Result: Generalized Covariance wins 6/8 tests, avg +0.7 dB**
 
 ## Mathematical Background
 
-### The Generalized Sample Covariance Matrix
-
-Define `B_n = S_n T_n` where:
-- `S_n = (1/n) X X^*` is the sample covariance matrix
-- `T_n` is a deterministic positive semidefinite matrix with spectral distribution converging to `H`
-
-For the two-point measure `H = beta * delta_a + (1 - beta) * delta_1`:
-- A fraction `beta` of dimensions have scale `a`
-- The remaining `(1 - beta)` have scale `1`
-
-### Theorem (Yu, 2025)
-
-The support of the limiting spectral distribution `F_{y,H}` is contained in:
+`B_n = S_n T_n` where `T_n` has spectral distribution converging to `H = β·δ_a + (1 − β)·δ_1`. The noise eigenvalue support is bounded by
 
 ```
-[max_{t in (0, inf)} g(t),  min_{t in (-1/a, 0)} g(t)]
+g(t) = -1/t + y · ( β·a/(1 + a·t) + (1 − β)/(1 + t) )
 ```
 
-where `g(t) = -1/t + y * (beta*a/(1+a*t) + (1-beta)/(1+t))`.
+with bulk edges
 
-The discriminant `Delta = B^2 - 4AC` (from the quartic `P_4(t)`) determines:
-- `Delta > 0`: single noise interval
-- `Delta < 0`: two disjoint noise intervals (gap contains signal)
+```
+λ_lower = σ² · max_{t > 0} g(t),
+λ_upper = σ² · min_{−1/a < t < 0} g(t).
+```
 
-### Connection to M-P Law
+When `a = 1` or `β = 0`, this reduces to classical Marčenko–Pastur: `[(1 − √y)², (1 + √y)²]`.
 
-When `a = 1` or `beta = 0`:
-- `g(t)` simplifies and the support becomes `[(1 - sqrt(y))^2, (1 + sqrt(y))^2]`
-- This is exactly the classical Marcenko-Pastur law
+The oracle workflow above selects `(a, β)` so that the corresponding acceptance-test rank gives the maximum PSNR against a clean reference, then bakes the resulting `T(a, β)` directly into the post-processed image.
 
 ## References
 
-1. Yu, Yao-Hsing (2025). "Geometric Analysis of the Eigenvalue Range of the Generalized Covariance Matrix." *2025 S.T. Yau High School Science Award (Asia)*.
-
-2. Gavish, M. & Donoho, D. L. (2017). "Optimal Shrinkage of Singular Values." *IEEE Transactions on Information Theory*, 63(4), 2137-2152.
-
-3. Marcenko, V. A. & Pastur, L. A. (1967). "Distribution of eigenvalues for some sets of random matrices." *Mathematics of the USSR-Sbornik*, 1(4), 457-483.
-
-4. Veraart, J. et al. (2016). "Denoising of diffusion MRI using random matrix theory." *NeuroImage*, 142, 394-406.
-
-5. Nadakuditi, R. R. (2014). "OptShrink: An Algorithm for Improved Low-Rank Signal Matrix Denoising." *IEEE Transactions on Information Theory*, 60(5), 3390-3408.
+1. Yu, Yao-Hsing (2025). "Geometric Analysis of the Eigenvalue Range of the Generalized Covariance Matrix." *2025 S.T. Yau High School Science Award (Asia).*
+2. Gavish, M. & Donoho, D. L. (2017). "Optimal Shrinkage of Singular Values." *IEEE Trans. Inf. Theory*, 63(4), 2137–2152.
+3. Marčenko, V. A. & Pastur, L. A. (1967). "Distribution of eigenvalues for some sets of random matrices." *Math. USSR-Sbornik*, 1(4), 457–483.
+4. Veraart, J. et al. (2016). "Denoising of diffusion MRI using random matrix theory." *NeuroImage*, 142, 394–406.
+5. Storn, R. & Price, K. (1997). "Differential Evolution — A Simple and Efficient Heuristic for Global Optimization over Continuous Spaces." *J. Global Optim.*, 11(4), 341–359.
 
 ## License
 

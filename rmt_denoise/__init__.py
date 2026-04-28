@@ -16,7 +16,7 @@ Usage:
     denoised = gc.denoise(noisy_images)
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 from .mp_law import MPLawDenoiser
 from .generalized_cov import GeneralizedCovDenoiser
@@ -33,10 +33,13 @@ from .core import (
     compute_discriminant,
     compute_explicit_support,
 )
+from .io import load_folder, split_train_test
 
 __all__ = [
     "MPLawDenoiser",
     "GeneralizedCovDenoiser",
+    "load_folder",
+    "split_train_test",
     "add_gaussian_noise",
     "add_laplacian_noise",
     "add_mixture_gaussian_noise",
