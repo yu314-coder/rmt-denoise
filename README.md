@@ -50,6 +50,33 @@ denoised = gc.denoise(noisy_image)  # (H, W) -> (H, W)
 print(gc.info)  # {'best_k': 16, 'a': 3.5, 'beta': 0.1, ...}
 ```
 
+### Option C: Oracle best (a, β) via differential evolution (v1.1+)
+
+When you have a **clean ground-truth reference** (synthetic benchmarks, MRI phantoms, oracle evaluation), pass it to `denoise()` to switch on the oracle path. The denoiser jointly optimises `(a, β)` via SciPy's `differential_evolution` to maximise PSNR vs the clean reference, then applies the resulting `T(a, β)` diagonal scaling and a color-resize step to every reconstructed image.
+
+```python
+from rmt_denoise import GeneralizedCovDenoiser
+
+noisy_images = ...     # (n, H, W)
+clean_test_image = ... # (H, W) — ground truth for ONE column of `noisy_images`
+
+gc = GeneralizedCovDenoiser(mode='multi', apply_t=True, color_resize=True)
+denoised = gc.denoise(noisy_images, clean=clean_test_image, test_index=-1)
+print(gc.info)
+# {'a': 0.27, 'beta': 0.95, 'sigma2': ..., 'rank': 12,
+#  'psnr_test': 34.5, 'method': 'best_a_beta_oracle', ...}
+```
+
+What it does, end-to-end:
+
+1. Centres the data: `X̃ = X − X̄` (always).
+2. Computes the SVD once (uses dual when p > n).
+3. Runs `differential_evolution` over `(log a, β)` with `a ∈ [0.01, 1.0]`, `β ∈ [0.01, 0.99]` (popsize 20, Sobol init, `seed=42`, polish on).
+4. For each candidate `(a, β)`: gen-cov acceptance test → rank `r̂` → cached projection → centring re-add → clip → `T(a, β)` (diag √a/1) → color-resize → PSNR vs `clean`.
+5. Returns the full reconstruction at the best rank, with `T` and color-resize applied to every column.
+
+Pass `apply_t=False` and/or `color_resize=False` to disable those post-processing steps.
+
 Both options also work with `MPLawDenoiser`:
 
 ```python
@@ -173,12 +200,16 @@ The denoising algorithm is the same — only the input differs:
 | `.denoise(images)` | Denoise `(n, H, W)` array. Returns `(n, H, W)`. |
 | `.info` | Dict: `sigma2`, `threshold`, `rank`, `y`, `p`, `n` |
 
-### `GeneralizedCovDenoiser(sigma2=None, a=None, beta=None, mode='multi', candidate_k=None)`
+### `GeneralizedCovDenoiser(sigma2=None, a=None, beta=None, mode='multi', candidate_k=None, stride_ratio=0.5, apply_t=True, color_resize=True)`
 
 | Method | Description |
 |---|---|
-| `.denoise(images)` | Denoise `(n, H, W)` or `(H, W)`. Returns same shape. |
-| `.info` | Dict: `a`, `beta`, `sigma2`, `threshold`, `threshold_mp`, `rank`, `rank_mp`, `y`, `n_intervals` |
+| `.denoise(images, clean=None, test_index=-1)` | Denoise `(n, H, W)` or `(H, W)`. Returns same shape. When `clean` is supplied (mode='multi'), runs the oracle best (a, β) path via differential evolution and applies the chosen `T(a, β)` plus optional color-resize. |
+| `.info` | Auto path: `a`, `beta`, `sigma2`, `threshold`, `threshold_mp`, `rank`, `rank_mp`, `y`, `n_intervals`. Oracle path: `a`, `beta`, `sigma2`, `rank`, `psnr_test`, `n_evals`, `apply_t`, `color_resize`, `method='best_a_beta_oracle'`. |
+
+Constructor flags new in **1.1.0**:
+- `apply_t` (default `True`) — multiply each reconstructed image by a diagonal `T` whose first ⌊p·β⌋ entries are √a and the rest are 1 (p = H·W).
+- `color_resize` (default `True`) — rescale each reconstructed image as `(x − min(x)) / max(x_before_subtract)` then clip to [0, 1].
 
 ### Noise Utilities
 
