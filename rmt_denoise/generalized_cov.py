@@ -123,12 +123,20 @@ class GeneralizedCovDenoiser:
         seed: int = 42,
         de_kwargs: Optional[dict] = None,
         device: str = 'auto',
+        apply_t: bool = True,
+        color_resize: bool = True,
+        center: bool = True,
     ):
         self.a_bracket = tuple(a_bracket)
         self.beta_bracket = tuple(beta_bracket)
         self.seed = int(seed)
         self.de_kwargs = dict(de_kwargs or {})
         self.device = str(device)
+        # Toggleable post-processing (re-introduced in v2.3.0). Defaults match
+        # the v2.2.x behaviour, so existing callers see identical output.
+        self.apply_t = bool(apply_t)
+        self.color_resize = bool(color_resize)
+        self.center = bool(center)
         self._info: dict = {}
         self.a: float = float('nan')
         self.beta: float = float('nan')
@@ -296,10 +304,12 @@ class GeneralizedCovDenoiser:
                 f"clean shape {clean_2d.shape} does not match images {(H, W)}"
             )
 
-        # Centre then SVD (CPU float64 or GPU float32 — same algorithm).
+        # Optional centring: X̃ = X − X̄ (when self.center is True), else
+        # use X as-is. SVD runs on the resulting matrix (CPU float64 or
+        # GPU float32 — same algorithm).
         X = images_to_matrix(images)               # (p, n)
-        x_mean = np.mean(X, axis=1, keepdims=True)
-        X_centered = X - x_mean
+        x_mean = np.mean(X, axis=1, keepdims=True) if self.center else np.zeros((X.shape[0], 1))
+        X_centered = X - x_mean if self.center else X.copy()
         U_full, svs_full, Vt_full, used_device = self._svd(X_centered)
         pos = svs_full > 1e-5
         U = U_full[:, pos]
@@ -363,8 +373,10 @@ class GeneralizedCovDenoiser:
             dv = _proj(r_a)
             dv_full = dv + x_mean_flat
             img = np.clip(dv_full.reshape(H, W), 0.0, 1.0)
-            img = self._apply_T_diag(img, a_j, b_j)
-            img = self._color_resize(img)
+            if self.apply_t:
+                img = self._apply_T_diag(img, a_j, b_j)
+            if self.color_resize:
+                img = self._color_resize(img)
             mse = float(np.mean((clean_2d - img) ** 2))
             psnr = (10.0 * np.log10(1.0 / mse)) if mse > 0 else 99.0
             if psnr > best['psnr']:
@@ -398,9 +410,12 @@ class GeneralizedCovDenoiser:
         X_rec = X_rec + x_mean
         denoised = matrix_to_images(X_rec, H, W)
         denoised = np.clip(denoised, 0.0, 1.0)
-        for i in range(denoised.shape[0]):
-            denoised[i] = self._apply_T_diag(denoised[i], a_hat, beta_hat)
-            denoised[i] = self._color_resize(denoised[i])
+        if self.apply_t or self.color_resize:
+            for i in range(denoised.shape[0]):
+                if self.apply_t:
+                    denoised[i] = self._apply_T_diag(denoised[i], a_hat, beta_hat)
+                if self.color_resize:
+                    denoised[i] = self._color_resize(denoised[i])
 
         self.a = float(a_hat)
         self.beta = float(beta_hat)

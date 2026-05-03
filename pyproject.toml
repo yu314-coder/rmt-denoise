@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rmt-denoise"
-version = "2.2.3"
+version = "2.3.0"
 description = "Image denoising via Random Matrix Theory: M-P Law and Generalized Covariance Matrix"
 readme = "README.md"
 license = {text = "MIT"}
