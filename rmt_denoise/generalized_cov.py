@@ -160,17 +160,59 @@ class GeneralizedCovDenoiser:
         return 'cpu'
 
     def _svd(self, X_centered: np.ndarray):
+        """Hybrid GPU/CPU SVD.
+
+        PyTorch's MPS backend (and some CUDA builds) doesn't implement
+        ``linalg.svd`` or ``linalg.eigh`` for general matrices. We bypass
+        that by doing the BLAS-heavy steps on-device (matmul / scale) and
+        the small eigendecomposition on CPU:
+
+            * form Gram matrix on-device via batched matmul (heavy step),
+            * pull the n×n (or p×p) Gram to CPU and eigendecompose,
+            * push V back to-device, recover U = X V Σ⁻¹ on-device.
+
+        For p ≫ n, the Gram is small (n×n) so the CPU eigh is sub-second
+        even at n = 3000 — the win is the on-device 10000×n matmul.
+        """
         dev = self._resolve_device()
         if dev == 'cpu':
             U_full, svs_full, Vt_full = np.linalg.svd(X_centered, full_matrices=False)
             return U_full, svs_full, Vt_full, 'cpu'
-        # GPU path via torch
         import torch
+        p, n = X_centered.shape
         Xt = torch.from_numpy(X_centered.astype(np.float32)).to(dev)
-        Ut, st, Vht = torch.linalg.svd(Xt, full_matrices=False)
-        U_full = Ut.cpu().numpy().astype(np.float64)
-        svs_full = st.cpu().numpy().astype(np.float64)
-        Vt_full = Vht.cpu().numpy().astype(np.float64)
+        if p >= n:
+            G = (Xt.T @ Xt)                                     # (n, n) on dev
+            G_cpu = G.cpu().numpy().astype(np.float64)
+            eigvals, V_cpu = np.linalg.eigh(G_cpu)              # ascending
+            eigvals = eigvals[::-1]
+            V_cpu = V_cpu[:, ::-1]
+            eigvals = np.clip(eigvals, 0.0, None)
+            svs_full = np.sqrt(eigvals)
+            mask = svs_full > 1e-5
+            svs_full = svs_full[mask]
+            V_cpu = V_cpu[:, mask]
+            V = torch.from_numpy(V_cpu.astype(np.float32)).to(dev)
+            inv = torch.from_numpy((1.0 / svs_full).astype(np.float32)).to(dev)
+            U = Xt @ (V * inv.unsqueeze(0))                     # (p, k) on dev
+            U_full = U.cpu().numpy().astype(np.float64)
+            Vt_full = V_cpu.T
+        else:
+            G = (Xt @ Xt.T)                                     # (p, p) on dev
+            G_cpu = G.cpu().numpy().astype(np.float64)
+            eigvals, U_cpu = np.linalg.eigh(G_cpu)
+            eigvals = eigvals[::-1]
+            U_cpu = U_cpu[:, ::-1]
+            eigvals = np.clip(eigvals, 0.0, None)
+            svs_full = np.sqrt(eigvals)
+            mask = svs_full > 1e-5
+            svs_full = svs_full[mask]
+            U_cpu = U_cpu[:, mask]
+            U_full = U_cpu
+            U_dev = torch.from_numpy(U_cpu.astype(np.float32)).to(dev)
+            inv = torch.from_numpy((1.0 / svs_full).astype(np.float32)).to(dev)
+            Vt = (inv.unsqueeze(1) * (U_dev.T @ Xt))            # (k, n)
+            Vt_full = Vt.cpu().numpy().astype(np.float64)
         return U_full, svs_full, Vt_full, dev
 
     # ------------------------------------------------------------------
